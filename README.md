@@ -19,6 +19,8 @@ Build with the `linux/arm64`, `linux/386`, `linux/amd64`, `linux/arm/v6`, `linux
 - **Automatic Cleanup**: Temporary files are automatically deleted after processing
 - **Health Monitoring**: Built-in health check endpoint
 - **Error Handling**: Comprehensive error handling with appropriate HTTP status codes
+- **Flexible Configuration**: All settings configurable via environment variables
+- **Multi-Architecture Support**: Supports ARM and x86 architectures
 
 ## Pull
 
@@ -40,9 +42,20 @@ docker run -d --name ffmpeg-service --restart on-failure \
   -p 8080:8080 \
   funnyzak/ffmpeg-service
 
-# Run with volume for persistent temp storage (optional)
+# Run with custom configuration
 docker run -d --name ffmpeg-service --restart on-failure \
   -p 8080:8080 \
+  -e MAX_FILE_SIZE=1073741824 \
+  -e FILE_RETENTION_HOURS=24 \
+  -e CLEANUP_INTERVAL_MINUTES=60 \
+  -e FLASK_DEBUG=false \
+  -v ./temp:/tmp/videos \
+  funnyzak/ffmpeg-service
+
+# Run with environment file
+docker run -d --name ffmpeg-service --restart on-failure \
+  -p 8080:8080 \
+  --env-file .env \
   -v ./temp:/tmp/videos \
   funnyzak/ffmpeg-service
 ```
@@ -58,12 +71,46 @@ services:
     image: funnyzak/ffmpeg-service:latest
     container_name: ffmpeg-service
     environment:
+      # System settings
       - TZ=Asia/Shanghai
+      
+      # Application configuration
+      - TEMP_DIR=/tmp/videos
+      - MAX_FILE_SIZE=524288000      # 500MB in bytes
+      - FILE_RETENTION_HOURS=2       # Keep output files for 2 hours
+      - CLEANUP_INTERVAL_MINUTES=30  # Run cleanup every 30 minutes
+      
+      # Supported formats (comma-separated)
+      - ALLOWED_VIDEO_EXTENSIONS=mp4,avi,mov,mkv,flv,wmv,webm,m4v
+      - SUPPORTED_OUTPUT_FORMATS=mp4,avi,mov,mkv,webm
+      
+      # Flask server settings
+      - FLASK_HOST=0.0.0.0
+      - FLASK_PORT=8080
+      - FLASK_DEBUG=false
     ports:
-      - "8080:8080"
+      - "${HOST_PORT:-8080}:${FLASK_PORT:-8080}"
     restart: on-failure
     volumes:
-      - ./temp:/tmp/videos  # Optional: for persistent temp storage
+      - ${TEMP_VOLUME:-./temp}:${TEMP_DIR:-/tmp/videos}
+```
+
+#### Using Environment File
+
+Create a `.env` file for easier configuration management:
+
+```env
+# Application configuration
+MAX_FILE_SIZE=1073741824          # 1GB
+FILE_RETENTION_HOURS=24           # Keep files for 24 hours
+CLEANUP_INTERVAL_MINUTES=60       # Cleanup every hour
+
+# Docker settings
+HOST_PORT=8080
+TEMP_VOLUME=./temp
+
+# Flask settings
+FLASK_DEBUG=false
 ```
 
 Then run:
@@ -79,6 +126,26 @@ docker build \
   --build-arg BUILD_DATE=`date -u +"%Y-%m-%dT%H:%M:%SZ"` \
   --build-arg VERSION="1.0.0" \
   -t funnyzak/ffmpeg-service:1.0.0 .
+```
+
+### Local Development
+
+For local development without Docker:
+
+```bash
+# Install system dependencies (Ubuntu/Debian)
+sudo apt-get update && sudo apt-get install -y ffmpeg libmagic1
+
+# Install Python dependencies
+pip install -r requirements.txt
+
+# Set environment variables (optional)
+export MAX_FILE_SIZE=104857600
+export FLASK_DEBUG=true
+export FILE_RETENTION_HOURS=1
+
+# Run the service
+python app.py
 ```
 
 ## API Endpoints
@@ -243,12 +310,48 @@ The service returns standardized error responses:
 
 ## Configuration
 
+All service configurations can be customized via environment variables. This makes it easy to adapt the service for different environments (development, testing, production) without code changes.
+
 ### Environment Variables
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `MAX_FILE_SIZE` | Maximum file size in bytes | 524288000 (500MB) |
-| `TEMP_DIR` | Temporary files directory | /tmp/videos |
+| Variable | Description | Default | Example |
+|----------|-------------|---------|---------|
+| `TEMP_DIR` | Temporary files directory | `/tmp/videos` | `/data/temp` |
+| `MAX_FILE_SIZE` | Maximum file size in bytes | `524288000` (500MB) | `1073741824` (1GB) |
+| `FILE_RETENTION_HOURS` | Hours to keep output files | `2` | `24` |
+| `CLEANUP_INTERVAL_MINUTES` | Cleanup task interval | `30` | `60` |
+| `ALLOWED_VIDEO_EXTENSIONS` | Comma-separated input formats | `mp4,avi,mov,mkv,flv,wmv,webm,m4v` | `mp4,avi,mov` |
+| `SUPPORTED_OUTPUT_FORMATS` | Comma-separated output formats | `mp4,avi,mov,mkv,webm` | `mp4,webm` |
+| `FLASK_HOST` | Flask server host | `0.0.0.0` | `127.0.0.1` |
+| `FLASK_PORT` | Flask server port | `8080` | `9000` |
+| `FLASK_DEBUG` | Enable debug mode | `false` | `true` |
+
+### Configuration Examples
+
+#### Development Environment
+```env
+FLASK_DEBUG=true
+MAX_FILE_SIZE=104857600        # 100MB for testing
+FILE_RETENTION_HOURS=1         # Quick cleanup
+CLEANUP_INTERVAL_MINUTES=10    # Frequent cleanup
+```
+
+#### Production Environment
+```env
+FLASK_DEBUG=false
+MAX_FILE_SIZE=2147483648       # 2GB
+FILE_RETENTION_HOURS=24        # Keep files longer
+CLEANUP_INTERVAL_MINUTES=60    # Less frequent cleanup
+ALLOWED_VIDEO_EXTENSIONS=mp4,mov,avi  # Limit formats
+```
+
+#### High-Security Environment
+```env
+MAX_FILE_SIZE=52428800         # 50MB limit
+FILE_RETENTION_HOURS=0.5       # 30 minutes retention
+CLEANUP_INTERVAL_MINUTES=5     # Very frequent cleanup
+SUPPORTED_OUTPUT_FORMATS=mp4   # Only MP4 output
+```
 
 ### Supported Formats
 
@@ -311,11 +414,13 @@ curl -X POST http://localhost:8080/process \
 
 ## Performance & Limitations
 
-- **File Size Limit**: 500MB per file
-- **Concurrent Processing**: Limited by container resources
-- **Temporary Storage**: Files are automatically cleaned up after processing
+- **File Size Limit**: Configurable via `MAX_FILE_SIZE` (default: 500MB)
+- **Concurrent Processing**: Limited by container resources and available memory
+- **Temporary Storage**: Files are automatically cleaned up based on `FILE_RETENTION_HOURS`
 - **Timeout**: 30 seconds for URL downloads
 - **Memory Usage**: Depends on video size and processing operations
+- **Cleanup Frequency**: Configurable via `CLEANUP_INTERVAL_MINUTES`
+- **Supported Formats**: Configurable via environment variables
 
 ## Security Considerations
 
@@ -330,19 +435,117 @@ curl -X POST http://localhost:8080/process \
 ### Common Issues
 
 1. **File Too Large Error**
-   - Reduce file size or increase `MAX_FILE_SIZE` limit
+   - Reduce file size or increase `MAX_FILE_SIZE` environment variable
+   - Example: `docker run -e MAX_FILE_SIZE=1073741824 ...` (1GB)
 
 2. **Processing Timeout**
    - Check video file integrity
    - Reduce processing complexity
+   - Increase container resources
 
 3. **Download Failed**
    - Verify URL accessibility
    - Check network connectivity
+   - Ensure URL points to a video file
 
 4. **Unsupported Format**
-   - Convert to supported format first
+   - Add format to `ALLOWED_VIDEO_EXTENSIONS` or `SUPPORTED_OUTPUT_FORMATS`
+   - Example: `ALLOWED_VIDEO_EXTENSIONS=mp4,avi,mov,custom_format`
    - Check FFmpeg codec support
+
+5. **Files Not Cleaned Up**
+   - Check `FILE_RETENTION_HOURS` and `CLEANUP_INTERVAL_MINUTES` settings
+   - Ensure sufficient disk space
+   - Verify temp directory permissions
+
+6. **Service Won't Start**
+   - Check environment variable syntax (no spaces in comma-separated values)
+   - Verify port availability
+   - Check container logs for detailed error messages
+
+7. **Configuration Not Applied**
+   - Restart container after changing environment variables
+   - Verify `.env` file format (no quotes around values)
+   - Check environment variable names (case-sensitive)
+
+### Environment Variable Best Practices
+
+1. **Format Lists Correctly**
+   ```env
+   # ✅ Correct: No spaces around commas
+   ALLOWED_VIDEO_EXTENSIONS=mp4,avi,mov,mkv
+   
+   # ❌ Wrong: Spaces around commas
+   ALLOWED_VIDEO_EXTENSIONS=mp4, avi, mov, mkv
+   ```
+
+2. **Use Appropriate Values**
+   ```env
+   # File sizes in bytes
+   MAX_FILE_SIZE=1073741824  # 1GB
+   
+   # Boolean values
+   FLASK_DEBUG=true  # or false, 1, 0, yes, no
+   
+   # Time values
+   FILE_RETENTION_HOURS=24    # Integer or decimal
+   ```
+
+3. **Environment-Specific Configuration**
+   ```bash
+   # Development
+   cp .env.development .env
+   
+   # Production  
+   cp .env.production .env
+   ```
+
+### Complete .env File Example
+
+Create a `.env` file with the following template:
+
+```env
+# FFmpeg Service Environment Configuration
+# Copy and modify as needed for your environment
+
+# System settings
+TZ=Asia/Shanghai
+
+# Application configuration
+TEMP_DIR=/tmp/videos
+MAX_FILE_SIZE=524288000              # 500MB in bytes (customize as needed)
+FILE_RETENTION_HOURS=2               # Keep output files for 2 hours  
+CLEANUP_INTERVAL_MINUTES=30          # Run cleanup every 30 minutes
+
+# Supported formats (comma-separated, no spaces around commas)
+ALLOWED_VIDEO_EXTENSIONS=mp4,avi,mov,mkv,flv,wmv,webm,m4v
+SUPPORTED_OUTPUT_FORMATS=mp4,avi,mov,mkv,webm
+
+# Flask server settings
+FLASK_HOST=0.0.0.0
+FLASK_PORT=8080
+FLASK_DEBUG=false
+
+# Docker Compose specific variables
+HOST_PORT=8080                       # Host port to expose the service
+TEMP_VOLUME=./temp                   # Host directory for temp files
+
+# Example configurations for different environments:
+
+# Production (high capacity)
+# MAX_FILE_SIZE=2147483648           # 2GB
+# FILE_RETENTION_HOURS=24            # Keep files for 24 hours
+# CLEANUP_INTERVAL_MINUTES=60        # Cleanup every hour
+
+# Development
+# FLASK_DEBUG=true
+# FILE_RETENTION_HOURS=1             # Keep files for 1 hour for quick testing
+# CLEANUP_INTERVAL_MINUTES=10        # More frequent cleanup
+
+# Testing
+# MAX_FILE_SIZE=104857600            # 100MB for testing
+# FILE_RETENTION_HOURS=0.5           # Keep files for 30 minutes only
+```
 
 ### Logs
 

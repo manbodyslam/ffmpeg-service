@@ -18,13 +18,19 @@ import magic
 
 app = Flask(__name__)
 
-# Configuration
-TEMP_DIR = "/tmp/videos"
-MAX_FILE_SIZE = 500 * 1024 * 1024  # 500MB
-FILE_RETENTION_HOURS = 2  # Keep output files for 2 hours
-CLEANUP_INTERVAL_MINUTES = 30  # Run cleanup every 30 minutes
-ALLOWED_VIDEO_EXTENSIONS = {'.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv', '.webm', '.m4v'}
-SUPPORTED_OUTPUT_FORMATS = {'mp4', 'avi', 'mov', 'mkv', 'webm'}
+# Configuration from environment variables
+TEMP_DIR = os.getenv('TEMP_DIR', '/tmp/videos')
+MAX_FILE_SIZE = int(os.getenv('MAX_FILE_SIZE', '524288000'))  # Default: 500MB
+FILE_RETENTION_HOURS = int(os.getenv('FILE_RETENTION_HOURS', '2'))
+CLEANUP_INTERVAL_MINUTES = int(os.getenv('CLEANUP_INTERVAL_MINUTES', '30'))
+
+# Parse allowed extensions from environment
+allowed_ext_str = os.getenv('ALLOWED_VIDEO_EXTENSIONS', 'mp4,avi,mov,mkv,flv,wmv,webm,m4v')
+ALLOWED_VIDEO_EXTENSIONS = {f'.{ext.strip()}' for ext in allowed_ext_str.split(',')}
+
+# Parse supported output formats from environment  
+output_fmt_str = os.getenv('SUPPORTED_OUTPUT_FORMATS', 'mp4,avi,mov,mkv,webm')
+SUPPORTED_OUTPUT_FORMATS = {fmt.strip() for fmt in output_fmt_str.split(',')}
 
 class VideoProcessor:
     """Video processing utility class"""
@@ -507,6 +513,11 @@ def internal_error(e):
     return create_response(code=500, msg="Internal server error"), 500
 
 if __name__ == '__main__':
+    # Configuration from environment variables
+    FLASK_HOST = os.getenv('FLASK_HOST', '0.0.0.0')
+    FLASK_PORT = int(os.getenv('FLASK_PORT', '8080'))
+    FLASK_DEBUG = os.getenv('FLASK_DEBUG', 'false').lower() in ('true', '1', 'yes', 'on')
+    
     # Ensure temp directory exists
     os.makedirs(TEMP_DIR, exist_ok=True)
     
@@ -517,4 +528,4 @@ if __name__ == '__main__':
     cleanup_old_files()
     
     # Run Flask app
-    app.run(host='0.0.0.0', port=8080, debug=False)
+    app.run(host=FLASK_HOST, port=FLASK_PORT, debug=FLASK_DEBUG)
