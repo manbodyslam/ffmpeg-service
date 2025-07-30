@@ -1,0 +1,19 @@
+version: "3.8"
+
+services:
+  ffmpeg-service:
+    build: .
+    container_name: ffmpeg-service
+    environment:
+      - TZ=Asia/Shanghai
+    ports:
+      - "8080:8080"
+    restart: on-failure
+    volumes:
+      - ./temp:/tmp/videos  # Optional: for persistent temp storage
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
