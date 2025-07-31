@@ -7,7 +7,7 @@
 
 A lightweight, containerized FFmpeg video processing microservice built with Flask and Python. This service provides HTTP API endpoints for video metadata extraction, screenshot capture, and format conversion.
 
-Build with the `linux/arm64`, `linux/386`, `linux/amd64`, `linux/arm/v6`, `linux/arm/v7`, `linux/arm64/v8` architectures.
+Build with the `linux/arm64`, `linux/amd64`, `linux/arm/v7` architectures.
 
 ## Features
 
