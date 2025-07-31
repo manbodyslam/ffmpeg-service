@@ -163,18 +163,6 @@ docker build \
   -t funnyzak/ffmpeg-service:1.0.0 .
 ```
 
-### Testing Gunicorn Configuration
-
-Before deploying with Gunicorn, you can test the configuration:
-
-```bash
-# Test the WSGI application
-python test_gunicorn.py
-
-# Test with Gunicorn locally
-gunicorn --bind 0.0.0.0:8080 --workers 2 app:app
-```
-
 ### Local Development
 
 For local development without Docker:
@@ -834,14 +822,6 @@ curl -X POST http://localhost:8080/process \
 - **Cleanup Frequency**: Configurable via `CLEANUP_INTERVAL_MINUTES`
 - **Supported Formats**: Configurable via environment variables
 
-## Security Considerations
-
-- **API Key Authentication**: Optional API key authentication for secure access to processing endpoints
-- Files are processed in isolated temporary directories
-- Automatic cleanup prevents disk space issues
-- Input validation for file types and sizes
-- No persistent storage of user files
-- Resource limits prevent abuse
 
 ## Troubleshooting
 
@@ -886,37 +866,6 @@ curl -X POST http://localhost:8080/process \
    - Check resolution limits (max: 7680x4320)
    - For aspect ratio preservation, use single dimension: `720`
 
-### Environment Variable Best Practices
-
-1. **Format Lists Correctly**
-   ```env
-   # ✅ Correct: No spaces around commas
-   ALLOWED_VIDEO_EXTENSIONS=mp4,avi,mov,mkv
-   
-   # ❌ Wrong: Spaces around commas
-   ALLOWED_VIDEO_EXTENSIONS=mp4, avi, mov, mkv
-   ```
-
-2. **Use Appropriate Values**
-   ```env
-   # File sizes in bytes
-   MAX_FILE_SIZE=1073741824  # 1GB
-   
-   # Boolean values
-   FLASK_DEBUG=true  # or false, 1, 0, yes, no
-   
-   # Time values
-   FILE_RETENTION_HOURS=24    # Integer or decimal
-   ```
-
-3. **Environment-Specific Configuration**
-   ```bash
-   # Development
-   cp .env.development .env
-   
-   # Production  
-   cp .env.production .env
-   ```
 
 ### Complete .env File Example
 
