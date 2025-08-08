@@ -11,6 +11,7 @@ A Flask-based microservice for video processing using FFmpeg
 
 import os
 import json
+import re
 import uuid
 import subprocess
 import time
@@ -176,18 +177,23 @@ def log_request_info(request_id=None):
         "user_agent": request.headers.get("User-Agent", "Unknown"),
         "content_length": request.content_length,
         "content_type": request.content_type,
+        "headers": dict(request.headers),
+        "args": request.args.to_dict(),
+        "form": request.form.to_dict(),
+        "json": request.get_json(silent=True) if request.is_json else None,
     }
     
     logger.info(f"Request {request_id}: {log_data}")
     return request_id
 
 
-def log_response_info(request_id, status_code, response_time=None):
+def log_response_info(request_id, status_code, response_time=None, response_data=None):
     """Log response information"""
     log_data = {
         "request_id": request_id,
         "status_code": status_code,
         "response_time_ms": response_time,
+        "response_data": response_data if response_data is not None else {},
     }
     
     if response_time:
@@ -1347,7 +1353,7 @@ def process_media():
 
         response_time = (time.time() - start_time) * 1000
         logger.info(f"Request {request_id}: Processing completed successfully in {response_time:.1f}ms")
-        log_response_info(request_id, 200, response_time)
+        log_response_info(request_id, 200, response_time, result)
 
         return create_response(
             msg="Media processing completed successfully", data=result
@@ -1431,7 +1437,7 @@ def get_media_info():
         
         response_time = (time.time() - start_time) * 1000
         logger.info(f"Request {request_id}: Info extraction completed in {response_time:.1f}ms")
-        log_response_info(request_id, 200, response_time)
+        log_response_info(request_id, 200, response_time, response_data)
         
         return create_response(msg=message, data=response_data)
 
