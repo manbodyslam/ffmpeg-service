@@ -1452,6 +1452,8 @@ def process_media():
         return create_response(
             code=500, msg=f"Processing failed: {str(e)}"
         ), 500
+
+
 @app.route("/concat", methods=["POST"])
 @require_api_key
 def concat_videos():
@@ -1611,6 +1613,89 @@ def concat_videos():
         cleanup_temp_files(*(temp_inputs + temp_intermediates + ([output_file] if output_file else [])))
         log_error(request_id, e, {"endpoint": "/concat"})
         return create_response(code=500, msg=f"Concat failed: {str(e)}"), 500
+        
+@app.route("/subtitle", methods=["POST"])
+@require_api_key
+def add_subtitle():
+    """
+    ใส่ซับให้วิดีโอ
+    รองรับ:
+      - multipart/form-data:
+          file=(video), subtitle=(.srt/.ass)
+      - application/json:
+          {"media_url": "...", "subtitle_url": "...", "mode": "hard|soft", "fonts_dir": "/usr/share/fonts", "crf": 23, "preset": "veryfast"}
+    """
+    start_time = time.time()
+    request_id = log_request_info()
+
+    temp_inputs = []       # สิ่งที่เราดาวน์โหลด/อัปโหลดเข้ามา → ลบได้เมื่อเสร็จ
+    temp_intermediates = []  # เอาต์พุตกลางหากมี
+    output_file = None
+
+    try:
+        # parse input
+        if request.is_json:
+            data = request.get_json() or {}
+        else:
+            data = request.form.to_dict()
+
+        mode = (data.get("mode") or "hard").lower()
+        fonts_dir = data.get("fonts_dir") or None
+        crf = str(_parse_int(data.get("crf") or 23))
+        preset = data.get("preset") or "veryfast"
+
+        # รับวิดีโอ
+        video_path = None
+        if "media_url" in data and data.get("media_url"):
+            video_path = download_media_from_url(data.get("media_url"))
+            temp_inputs.append(video_path)
+        elif "file" in request.files:
+            video_path = save_uploaded_file(request.files["file"])
+            temp_inputs.append(video_path)
+        else:
+            return create_response(code=400, msg="Need media_url or file (video)"), 400
+
+        # รับไฟล์ซับ
+        sub_path = None
+        if "subtitle_url" in data and data.get("subtitle_url"):
+            sub_path = download_media_from_url(data.get("subtitle_url"))
+            temp_inputs.append(sub_path)
+        elif "subtitle" in request.files:
+            f = request.files["subtitle"]
+            # save as temp
+            sub_name = f"sub_{uuid.uuid4().hex}{os.path.splitext(f.filename or '')[1]}"
+            sub_path = os.path.join(TEMP_DIR, sub_name)
+            f.save(sub_path)
+            temp_inputs.append(sub_path)
+        else:
+            return create_response(code=400, msg="Need subtitle_url or subtitle file"), 400
+
+        # ดำเนินการ
+        if mode == "soft":
+            output_file = _apply_soft_subtitle(video_path, sub_path)
+        else:
+            output_file = _apply_hard_subtitle(video_path, sub_path, fonts_dir=fonts_dir, crf=crf, preset=preset)
+
+        result = {
+            "output": {
+                "filename": os.path.basename(output_file),
+                "url": create_download_url(os.path.basename(output_file))
+            },
+            "mode": mode,
+            "fonts_dir": fonts_dir
+        }
+
+        # ลบไฟล์อินพุต
+        cleanup_temp_files(*temp_inputs)
+
+        elapsed = (time.time() - start_time) * 1000
+        log_response_info(request_id, 200, elapsed, result)
+        return create_response(msg="Subtitle applied", data=result)
+
+    except Exception as e:
+        cleanup_temp_files(*(temp_inputs + temp_intermediates + ([output_file] if output_file else [])))
+        log_error(request_id, e, {"endpoint": "/subtitle"})
+        return create_response(code=500, msg=f"Subtitle failed: {str(e)}"), 500
 
 
 @app.route("/info", methods=["POST"])
