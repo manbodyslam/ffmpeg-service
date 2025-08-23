@@ -950,6 +950,81 @@ def start_cleanup_thread():
         f"Started cleanup thread (interval: {CLEANUP_INTERVAL_MINUTES} "
         f"minutes, retention: {FILE_RETENTION_HOURS} hours)"
     )
+# ---------- NEW HELPERS: subtitle & bgm ----------
+
+def _ensure_local_path(maybe_url_or_path, kind="generic"):
+    """
+    รับเป็น URL หรือพาธโลคอล ถ้าเป็น URL จะดาวน์โหลดมาที่ TEMP_DIR แล้วคืนพาธที่โหลด
+    """
+    if not maybe_url_or_path:
+        raise ValueError(f"{kind} is required")
+    if isinstance(maybe_url_or_path, str) and re.match(r"^https?://", maybe_url_or_path):
+        return download_media_from_url(maybe_url_or_path)
+    return maybe_url_or_path  # assume local path
+
+
+def _apply_hard_subtitle(video_path, sub_path, fonts_dir=None, crf="23", preset="veryfast"):
+    out_name = f"sub_hard_{uuid.uuid4().hex}.mp4"
+    out_path = os.path.join(TEMP_DIR, out_name)
+
+    vf = f"subtitles={sub_path}"
+    if fonts_dir:
+        vf += f":fontsdir={fonts_dir}"
+
+    cmd = [
+        "ffmpeg", "-y", "-i", video_path,
+        "-vf", vf,
+        "-c:v", "libx264", "-crf", str(crf), "-preset", str(preset),
+        "-c:a", "copy",
+        out_path
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise Exception(f"Hard-sub failed: {r.stderr}")
+    return out_path
+
+
+def _apply_soft_subtitle(video_path, sub_path):
+    out_name = f"sub_soft_{uuid.uuid4().hex}.mp4"
+    out_path = os.path.join(TEMP_DIR, out_name)
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", video_path, "-i", sub_path,
+        "-c:v", "copy", "-c:a", "copy",
+        "-c:s", "mov_text",
+        "-metadata:s:s:0", "language=th",
+        out_path
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise Exception(f"Soft-sub failed: {r.stderr}")
+    return out_path
+
+
+def _mix_bgm(video_path, bgm_path, mode="mix", bgm_gain=0.25):
+    """
+    mode: 'mix' (amix) | 'ducking' (sidechaincompress)
+    """
+    out_name = f"bgm_{uuid.uuid4().hex}.mp4"
+    out_path = os.path.join(TEMP_DIR, out_name)
+
+    if mode == "ducking":
+        filter_complex = f"[1:a]volume={bgm_gain}[b];[0:a][b]sidechaincompress=threshold=0.03:ratio=8:attack=5:release=200[outa]"
+    else:
+        filter_complex = f"[0:a]volume=1.0[a0];[1:a]volume={bgm_gain}[a1];[a0][a1]amix=inputs=2:dropout_transition=2:normalize=1[outa]"
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", video_path, "-i", bgm_path,
+        "-filter_complex", filter_complex,
+        "-map", "0:v", "-map", "[outa]",
+        "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+        out_path
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise Exception(f"BGM mix failed: {r.stderr}")
+    return out_path
 
 
 # API Routes
