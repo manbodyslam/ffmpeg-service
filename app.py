@@ -1452,6 +1452,266 @@ def process_media():
         return create_response(
             code=500, msg=f"Processing failed: {str(e)}"
         ), 500
+@app.route("/bgm", methods=["POST"])
+@require_api_key
+def add_bgm():
+    """
+    เพิ่มเพลงประกอบลงในวิดีโอ
+    รองรับ:
+      - multipart/form-data:
+          file=(video), bgm=(audio)
+      - application/json:
+          {"media_url": "...", "bgm_url": "...", "mode": "mix|ducking", "bgm_gain": 0.25}
+    """
+    start_time = time.time()
+    request_id = log_request_info()
+
+    temp_inputs = []
+    output_file = None
+
+    try:
+        if request.is_json:
+            data = request.get_json() or {}
+        else:
+            data = request.form.to_dict()
+
+        mode = (data.get("mode") or "mix").lower()
+        bgm_gain = float(data.get("bgm_gain") or 0.25)
+
+        # วิดีโอ
+        video_path = None
+        if "media_url" in data and data.get("media_url"):
+            video_path = download_media_from_url(data.get("media_url"))
+            temp_inputs.append(video_path)
+        elif "file" in request.files:
+            video_path = save_uploaded_file(request.files["file"])
+            temp_inputs.append(video_path)
+        else:
+            return create_response(code=400, msg="Need media_url or file (video)"), 400
+
+        # เพลง
+        bgm_path = None
+        if "bgm_url" in data and data.get("bgm_url"):
+            bgm_path = download_media_from_url(data.get("bgm_url"))
+            temp_inputs.append(bgm_path)
+        elif "bgm" in request.files:
+            f = request.files["bgm"]
+            bgm_name = f"bgm_{uuid.uuid4().hex}{os.path.splitext(f.filename or '')[1]}"
+            bgm_path = os.path.join(TEMP_DIR, bgm_name)
+            f.save(bgm_path)
+            temp_inputs.append(bgm_path)
+        else:
+            return create_response(code=400, msg="Need bgm_url or bgm file"), 400
+
+        output_file = _mix_bgm(video_path, bgm_path, mode=mode, bgm_gain=bgm_gain)
+
+        result = {
+            "output": {
+                "filename": os.path.basename(output_file),
+                "url": create_download_url(os.path.basename(output_file))
+            },
+            "mode": mode,
+            "bgm_gain": bgm_gain
+        }
+
+        cleanup_temp_files(*temp_inputs)
+
+        elapsed = (time.time() - start_time) * 1000
+        log_response_info(request_id, 200, elapsed, result)
+        return create_response(msg="BGM mixed", data=result)
+
+    except Exception as e:
+        cleanup_temp_files(*(temp_inputs + ([output_file] if output_file else [])))
+        log_error(request_id, e, {"endpoint": "/bgm"})
+        return create_response(code=500, msg=f"BGM mix failed: {str(e)}"), 500
+@app.route("/edit", methods=["POST"])
+@require_api_key
+def edit_pipeline():
+    """
+    Pipeline ตัดต่อหลายขั้นตอนในครั้งเดียว
+    JSON ตัวอย่าง:
+    {
+      "inputs": [{"url":"https://.../a.mp4"},{"url":"https://.../b.mp4"}],
+      "operations": [
+        {"type":"concat","resolution":"1920x1080","fps":30,"crf":23,"preset":"veryfast"},
+        {"type":"subtitle","mode":"hard","subtitle_url":"https://.../th.srt","fonts_dir":"/usr/share/fonts"},
+        {"type":"bgm","bgm_url":"https://.../bgm.mp3","mode":"ducking","bgm_gain":0.25},
+        {"type":"convert","format":"mp4","quality":"medium","resolution":"1080p"},
+        {"type":"screenshot","count":3},
+        {"type":"metadata"}
+      ]
+    }
+    """
+    start_time = time.time()
+    request_id = log_request_info()
+    temp_inputs, temp_inter, output_file = [], [], None
+    result = {}
+
+    try:
+        payload = request.get_json(force=True)
+        inputs = payload.get("inputs") or []
+        ops = payload.get("operations") or []
+
+        # 1) เตรียมอินพุต
+        local_inputs = []
+        for it in inputs:
+            url = it.get("url")
+            if url:
+                p = download_media_from_url(url)
+                temp_inputs.append(p)
+                local_inputs.append(p)
+
+        current = None
+        if len(local_inputs) == 1:
+            current = local_inputs[0]
+
+        # 2) วนทำ operations
+        screenshots = []
+        info = None
+
+        for op in ops:
+            t = (op.get("type") or "").lower()
+
+            if t == "concat":
+                # ใช้แนวคิด normalize แล้ว concat ด้วย filter_complex
+                res = op.get("resolution")
+                fps = _parse_int(op.get("fps"))
+                crf = str(_parse_int(op.get("crf") or 23))
+                preset = op.get("preset") or "veryfast"
+
+                if len(local_inputs) < 2:
+                    return create_response(code=400, msg="concat requires inputs >= 2"), 400
+
+                # normalize
+                norm_paths = []
+                for idx, src in enumerate(local_inputs, 1):
+                    norm_name = f"norm_{uuid.uuid4().hex}_{idx}.mp4"
+                    norm_path = os.path.join(TEMP_DIR, norm_name)
+                    cmd = ["ffmpeg", "-y", "-i", src, "-c:v", "libx264", "-c:a", "aac", "-preset", preset, "-crf", crf]
+
+                    vf = []
+                    if res:
+                        try:
+                            r = VideoProcessor(src)._parse_resolution(res)
+                            if r:
+                                vf.append(f"scale={r}")
+                        except Exception:
+                            pass
+                    if fps and fps > 0:
+                        vf.append(f"fps={fps}")
+                    if vf:
+                        cmd.extend(["-vf", ",".join(vf)])
+
+                    cmd.append(norm_path)
+                    r = subprocess.run(cmd, capture_output=True, text=True)
+                    if r.returncode != 0:
+                        raise Exception(f"Normalization failed: {r.stderr}")
+                    norm_paths.append(norm_path)
+                    temp_inter.append(norm_path)
+
+                # concat
+                cmd = ["ffmpeg", "-y"]
+                for p in norm_paths:
+                    cmd.extend(["-i", p])
+                n = len(norm_paths)
+                filter_inputs = "".join([f"[{i}:v:0][{i}:a:0]" for i in range(n)])
+                filter_graph = f"{filter_inputs}concat=n={n}:v=1:a=1[outv][outa]"
+                out_name = f"concat_{uuid.uuid4().hex}.mp4"
+                current = os.path.join(TEMP_DIR, out_name)
+                cmd.extend(["-filter_complex", filter_graph, "-map", "[outv]", "-map", "[outa]", "-movflags", "+faststart", current])
+                r = subprocess.run(cmd, capture_output=True, text=True)
+                if r.returncode != 0:
+                    raise Exception(f"Concat failed: {r.stderr}")
+
+            elif t == "subtitle":
+                if not current:
+                    return create_response(code=400, msg="subtitle requires a video (concat or single input first)"), 400
+                mode = (op.get("mode") or "hard").lower()
+                sub_url = op.get("subtitle_url") or op.get("url")
+                fonts_dir = op.get("fonts_dir")
+                crf = str(_parse_int(op.get("crf") or 23))
+                preset = op.get("preset") or "veryfast"
+                if not sub_url:
+                    return create_response(code=400, msg="subtitle_url is required"), 400
+
+                sub_path = _ensure_local_path(sub_url, "subtitle")
+                temp_inputs.append(sub_path)
+                current = _apply_soft_subtitle(current, sub_path) if mode == "soft" else _apply_hard_subtitle(current, sub_path, fonts_dir, crf, preset)
+                temp_inter.append(current)
+
+            elif t in ("bgm", "bgm_mix"):
+                if not current:
+                    return create_response(code=400, msg="bgm requires a video (concat or single input first)"), 400
+                bgm_url = op.get("bgm_url") or op.get("url")
+                mode = (op.get("mode") or "mix").lower()
+                bgm_gain = float(op.get("bgm_gain") or 0.25)
+                if not bgm_url:
+                    return create_response(code=400, msg="bgm_url is required"), 400
+                bgm_path = _ensure_local_path(bgm_url, "bgm")
+                temp_inputs.append(bgm_path)
+                current = _mix_bgm(current, bgm_path, mode=mode, bgm_gain=bgm_gain)
+                temp_inter.append(current)
+
+            elif t == "convert":
+                if not current:
+                    return create_response(code=400, msg="convert requires a media first"), 400
+                fmt = op.get("format") or "mp4"
+                quality = op.get("quality") or "medium"
+                resolution = op.get("resolution")
+                vp = VideoProcessor(current)
+                conv = vp.convert_format(fmt, quality, resolution)
+                current = conv["file_path"]
+                temp_inter.append(current)
+                result["conversion"] = conv
+
+            elif t == "screenshot":
+                if not current:
+                    return create_response(code=400, msg="screenshot requires a video first"), 400
+                vp = VideoProcessor(current)
+                count = _parse_int(op.get("count") or 3)
+                timestamps = op.get("timestamps")
+                shots = vp.take_screenshots(timestamps=timestamps, count=count)
+                screenshots.extend(shots)
+
+            elif t == "metadata":
+                # ใช้ /info logic แบบย่อ
+                proc, mtype = create_media_processor(current or (local_inputs[0] if local_inputs else None))
+                if mtype == "video":
+                    info = proc.get_video_info()
+                else:
+                    info = proc.get_audio_info()
+
+            else:
+                return create_response(code=400, msg=f"Unknown operation: {t}"), 400
+
+        if not current:
+            return create_response(code=400, msg="No output produced"), 400
+
+        output_file = current
+        data = {
+            "output": {
+                "filename": os.path.basename(output_file),
+                "url": create_download_url(os.path.basename(output_file))
+            }
+        }
+        if screenshots:
+            data["screenshots"] = screenshots
+        if info:
+            data["metadata"] = info
+        if "conversion" in result:
+            data["conversion"] = result["conversion"]
+
+        # clean original inputs
+        cleanup_temp_files(*temp_inputs)
+
+        elapsed = (time.time() - start_time) * 1000
+        log_response_info(request_id, 200, elapsed, data)
+        return create_response(msg="Edit pipeline success", data=data)
+
+    except Exception as e:
+        cleanup_temp_files(*(temp_inputs + temp_inter + ([output_file] if output_file else [])))
+        log_error(request_id, e, {"endpoint": "/edit"})
+        return create_response(code=500, msg=f"Edit pipeline failed: {str(e)}"), 500
 
 
 @app.route("/concat", methods=["POST"])
