@@ -1377,6 +1377,165 @@ def process_media():
         return create_response(
             code=500, msg=f"Processing failed: {str(e)}"
         ), 500
+@app.route("/concat", methods=["POST"])
+@require_api_key
+def concat_videos():
+    """
+    Concatenate 2–10 videos.
+    Accepts:
+      - multipart/form-data: files[] (multiple n8n Binary File)
+      - application/json: {"urls": ["http://...mp4", ...]}
+    Options (form or json):
+      - resolution: "720p", "1080p", "1920x1080", etc. (optional)
+      - fps: int (optional, e.g. 30)
+      - crf: int (optional, default 23)
+      - preset: str (optional, default "veryfast")
+    """
+    start_time = time.time()
+    request_id = log_request_info()
+
+    # inputs we create and must cleanup
+    temp_inputs = []
+    temp_intermediates = []
+    output_file = None
+
+    try:
+        # -------- Parse inputs --------
+        videos = []  # list of local file paths
+
+        if request.is_json:
+            data = request.get_json() or {}
+        else:
+            data = request.form.to_dict()
+
+        # options
+        resolution = data.get("resolution") or None
+        fps = _parse_int(data.get("fps"))
+        crf = str(_parse_int(data.get("crf") or 23))
+        preset = data.get("preset") or "veryfast"
+
+        # from multipart files
+        files = request.files.getlist("files[]") if not request.is_json else []
+        if files:
+            for f in files:
+                path = save_uploaded_file(f)
+                temp_inputs.append(path)
+                videos.append(path)
+
+        # from json/form urls
+        urls = data.get("urls")
+        if isinstance(urls, str):
+            # can be JSON string or comma-separated
+            try:
+                urls = json.loads(urls)
+            except Exception:
+                urls = [u.strip() for u in urls.split(",") if u.strip()]
+        if urls:
+            for u in urls:
+                p = download_media_from_url(u)
+                temp_inputs.append(p)
+                videos.append(p)
+
+        # basic validation
+        if len(videos) < 2:
+            return create_response(code=400, msg="Need at least 2 videos (files[] or urls[])"), 400
+        if len(videos) > 10:
+            return create_response(code=400, msg="Too many inputs (max 10)"), 400
+
+        # ensure temp dir
+        os.makedirs(TEMP_DIR, exist_ok=True)
+
+        # -------- Normalize each input (same codec/res/fps) --------
+        # Concat will be stable if we re-encode each clip to the same spec.
+        norm_paths = []
+        for idx, src in enumerate(videos, 1):
+            norm_name = f"norm_{uuid.uuid4().hex}_{idx}.mp4"
+            norm_path = os.path.join(TEMP_DIR, norm_name)
+
+            # build ffmpeg command
+            cmd = ["ffmpeg", "-y", "-i", src, "-c:v", "libx264", "-c:a", "aac", "-preset", preset, "-crf", crf]
+
+            vf = []
+            # resolution
+            if resolution:
+                try:
+                    # reuse your parser to build WxH string
+                    r = VideoProcessor(src)._parse_resolution(resolution)
+                    if r:
+                        vf.append(f"scale={r}")
+                except Exception:
+                    pass
+            # fps
+            if fps and fps > 0:
+                vf.append(f"fps={fps}")
+
+            if vf:
+                cmd.extend(["-vf", ",".join(vf)])
+
+            cmd.append(norm_path)
+
+            logger.debug(f"[concat-normalize] {' '.join(cmd)}")
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if r.returncode != 0:
+                raise Exception(f"Normalization failed: {r.stderr}")
+
+            norm_paths.append(norm_path)
+            temp_intermediates.append(norm_path)
+
+        # -------- Concat normalized clips --------
+        # Use filter_complex concat to merge both audio & video.
+        # Build inputs list
+        cmd = ["ffmpeg", "-y"]
+        for p in norm_paths:
+            cmd.extend(["-i", p])
+
+        n = len(norm_paths)
+        filter_inputs = "".join([f"[{i}:v:0][{i}:a:0]" for i in range(n)])
+        filter_graph = f"{filter_inputs}concat=n={n}:v=1:a=1[outv][outa]"
+
+        out_name = f"concat_{uuid.uuid4().hex}.mp4"
+        output_file = os.path.join(TEMP_DIR, out_name)
+
+        cmd.extend([
+            "-filter_complex", filter_graph,
+            "-map", "[outv]", "-map", "[outa]",
+            "-movflags", "+faststart",
+            output_file
+        ])
+
+        logger.debug(f"[concat] {' '.join(cmd)}")
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            raise Exception(f"Concat failed: {r.stderr}")
+
+        # -------- Build response --------
+        file_url = create_download_url(os.path.basename(output_file))
+        result = {
+            "output": {
+                "filename": os.path.basename(output_file),
+                "url": file_url
+            },
+            "count": n,
+            "options": {
+                "resolution": resolution or "original",
+                "fps": fps,
+                "crf": crf,
+                "preset": preset
+            }
+        }
+
+        # remove only original inputs; keep output
+        cleanup_temp_files(*temp_inputs)
+
+        elapsed = (time.time() - start_time) * 1000
+        log_response_info(request_id, 200, elapsed, result)
+        return create_response(msg="Concat success", data=result)
+
+    except Exception as e:
+        # on error: remove everything we created
+        cleanup_temp_files(*(temp_inputs + temp_intermediates + ([output_file] if output_file else [])))
+        log_error(request_id, e, {"endpoint": "/concat"})
+        return create_response(code=500, msg=f"Concat failed: {str(e)}"), 500
 
 
 @app.route("/info", methods=["POST"])
