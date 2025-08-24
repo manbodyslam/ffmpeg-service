@@ -892,3 +892,150 @@ docker logs ffmpeg-service
 - [FFmpeg Documentation](https://ffmpeg.org/documentation.html)
 - [Flask Documentation](https://flask.palletsprojects.com/)
 - [Docker Best Practices](https://docs.docker.com/develop/dev-best-practices/)
+
+
+## เพิ่ม
+# 📖 FFmpeg Service – API Documentation (อัปเดต)
+
+A **Flask + FFmpeg Microservice** สำหรับแปลงไฟล์วิดีโอ/เสียง, รวมไฟล์, เพิ่มซับ, ใส่ข้อความ, และต่อวิดีโอพร้อมทรานซิชัน ✨  
+
+---
+
+## 🔑 Authentication
+ทุก endpoint (ยกเว้น `/` และ `/health`) ต้องส่ง API Key  
+```http
+X-API-Key: YOUR_API_KEY
+```
+
+---
+
+## 🚦 Endpoints
+
+### 1. Health Check
+```http
+GET /health
+```
+**Response:**  
+```json
+{ "code": 0, "msg": "Service is healthy", "data": {} }
+```
+
+---
+
+### 2. Get Media Info
+```http
+POST /info
+```
+**Options:**
+- `media_url`: URL ของไฟล์
+- หรือ upload `file` แบบ multipart
+
+---
+
+### 3. Process Media (multi-purpose)
+```http
+POST /process
+```
+รองรับ:
+- `extract_info` → ดึง metadata
+- `take_screenshots` → ถ่ายภาพนิ่ง
+- `convert_format` → แปลงไฟล์ (video/audio)
+
+---
+
+### 4. Concat Videos (ต่อหลายไฟล์แบบ cut ธรรมดา)
+```http
+POST /concat
+```
+**Options:**
+- `urls`: [list ของไฟล์]
+- `resolution`: `"720p"`, `"1080p"`, `"9:16"`, `"1:1"` ฯลฯ
+- `fps`: เฟรมเรต
+- `crf`: คุณภาพ (ค่าเล็ก = ชัดกว่า)
+- `preset`: encode speed (`ultrafast` → `veryslow`)
+- `mute`: true/false
+
+---
+
+### 5. Concat Videos with Transition ✨
+```http
+POST /concat_transition
+```
+**Options:**
+- `urls`: [list ของไฟล์] หรือ `files[]` (multipart)
+- `resolution`: เช่น `"9:16"`, `"1080p"`, `"720p"`
+- `fps`: เฟรมเรต
+- `crf`: คุณภาพ
+- `preset`: encode speed
+- `transition`: ชนิดทรานซิชัน (เช่น `fade`, `wipeleft`, `slideright`, `circleopen`, `pixelize`, `smoothleft`)
+- `duration`: ความยาวทรานซิชัน (วินาที)
+- `mute`: true/false (ไม่มีเสียง หรือทำเฉพาะภาพ)
+
+**ตัวอย่าง cURL**
+```bash
+curl -X POST "https://YOUR_HOST/concat_transition"   -H "X-API-Key: YOUR_API_KEY"   -H "Content-Type: application/json"   -d '{
+    "urls": [
+      "https://your.cdn/v1.mp4",
+      "https://your.cdn/v2.mp4"
+    ],
+    "resolution": "9:16",
+    "transition": "fade",
+    "duration": 1.0,
+    "mute": true
+  }'
+```
+
+---
+
+### 6. Subtitle
+```http
+POST /subtitle
+```
+- `mode`: `"hard"` (burn-in) หรือ `"soft"` (embed)
+- รองรับ `.srt` `.ass`
+
+---
+
+### 7. Add BGM (Background Music)
+```http
+POST /bgm
+```
+- `bgm_url` หรือ `bgm` (upload file)
+- `mode`: `"mix"` (ผสมปกติ) หรือ `"ducking"` (เสียงพูดเด่น)
+- `bgm_gain`: ระดับเสียงเพลง (0.0–1.0)
+
+---
+
+### 8. Add Text (Overlay)
+```http
+POST /text
+```
+(กำลังจะเพิ่ม) ใช้ `drawtext` ใส่ข้อความลงบนวิดีโอ  
+- `text`: ข้อความ  
+- `fontsize`, `fontcolor`, `x`, `y`, `fontfile`  
+
+---
+
+### 9. Download File
+```http
+GET /download/<filename>?auto_delete=true
+```
+โหลดไฟล์ผลลัพธ์ที่ server เก็บไว้
+
+---
+
+## 🎬 ตัวอย่าง n8n – HTTP Request Node
+```json
+{
+  "parameters": {
+    "url": "https://YOUR_HOST/concat_transition",
+    "method": "POST",
+    "jsonParameters": true,
+    "headerParametersJson": "{ \"X-API-Key\": \"YOUR_API_KEY\" }",
+    "bodyParametersJson": "{\n  \"urls\": [\n    \"https://your.cdn/v1.mp4\",\n    \"https://your.cdn/v2.mp4\"\n  ],\n  \"resolution\": \"9:16\",\n  \"transition\": \"fade\",\n  \"duration\": 1.0,\n  \"mute\": true\n}"
+  },
+  "name": "Concat Transition",
+  "type": "n8n-nodes-base.httpRequest",
+  "typeVersion": 1
+}
+```
