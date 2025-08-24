@@ -1713,32 +1713,48 @@ def edit_pipeline():
         log_error(request_id, e, {"endpoint": "/edit"})
         return create_response(code=500, msg=f"Edit pipeline failed: {str(e)}"), 500
 
+def _has_audio_stream(path):
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a",
+             "-show_entries", "stream=index", "-of", "csv=p=0", path],
+            capture_output=True, text=True
+        )
+        return r.returncode == 0 and r.stdout.strip() != ""
+    except Exception:
+        return False
 
 @app.route("/concat", methods=["POST"])
 @require_api_key
 def concat_videos():
     """
     Concatenate 2–10 videos.
-    Accepts:
-      - multipart/form-data: files[] (multiple n8n Binary File)
-      - application/json: {"urls": ["http://...mp4", ...]}
-    Options (form or json):
-      - resolution: "720p", "1080p", "1920x1080", etc. (optional)
-      - fps: int (optional, e.g. 30)
+
+    ยอมรับได้ 2 รูปแบบ:
+      1) multipart/form-data:
+           files[] (อัปโหลดหลายไฟล์)
+         ตัวเลือก: resolution, fps, crf, preset, mute
+      2) application/json:
+           {"urls": ["http://...mp4", ...], "resolution":"1080p", "fps":30, "crf":23, "preset":"veryfast", "mute": true}
+
+    พารามิเตอร์:
+      - resolution: "720p" | "1080p" | "1920x1080" | "1280:720" ฯลฯ (optional)
+      - fps: int (optional)
       - crf: int (optional, default 23)
       - preset: str (optional, default "veryfast")
+      - mute: bool (optional, default false) → ถ้า true จะตัดเสียงออกทั้งหมด (video-only)
     """
     start_time = time.time()
     request_id = log_request_info()
 
-    # inputs we create and must cleanup
-    temp_inputs = []
-    temp_intermediates = []
+    # ไฟล์ที่ต้องลบเมื่อจบงาน
+    temp_inputs = []         # อินพุตที่เราดาวน์โหลด/อัปโหลดเข้ามา
+    temp_intermediates = []  # ไฟล์กลางที่เกิดจาก normalize
     output_file = None
 
     try:
         # -------- Parse inputs --------
-        videos = []  # list of local file paths
+        videos = []  # local paths ของวิดีโอทั้งหมด
 
         if request.is_json:
             data = request.get_json() or {}
@@ -1750,6 +1766,7 @@ def concat_videos():
         fps = _parse_int(data.get("fps"))
         crf = str(_parse_int(data.get("crf") or 23))
         preset = data.get("preset") or "veryfast"
+        mute = _parse_bool(data.get("mute", False))  # << NEW: รวมแบบเงียบ
 
         # from multipart files
         files = request.files.getlist("files[]") if not request.is_json else []
@@ -1762,7 +1779,7 @@ def concat_videos():
         # from json/form urls
         urls = data.get("urls")
         if isinstance(urls, str):
-            # can be JSON string or comma-separated
+            # อาจเป็น JSON string หรือ comma-separated
             try:
                 urls = json.loads(urls)
             except Exception:
@@ -1782,30 +1799,35 @@ def concat_videos():
         # ensure temp dir
         os.makedirs(TEMP_DIR, exist_ok=True)
 
-        # -------- Normalize each input (same codec/res/fps) --------
-        # Concat will be stable if we re-encode each clip to the same spec.
+        # -------- Normalize each input (ให้สเปคตรงกันก่อน concat) --------
+        # - วิดีโอ: h264 (libx264) + ตัวเลือก scale, fps
+        # - เสียง:
+        #     * ถ้า mute=True → ตัดเสียงทิ้ง (-an)
+        #     * ถ้า mute=False → เข้ารหัสเป็น aac
         norm_paths = []
         for idx, src in enumerate(videos, 1):
             norm_name = f"norm_{uuid.uuid4().hex}_{idx}.mp4"
             norm_path = os.path.join(TEMP_DIR, norm_name)
 
-            # build ffmpeg command
-            cmd = ["ffmpeg", "-y", "-i", src, "-c:v", "libx264", "-c:a", "aac", "-preset", preset, "-crf", crf]
+            cmd = ["ffmpeg", "-y", "-i", src, "-c:v", "libx264", "-preset", preset, "-crf", crf]
 
+            # จัดการเสียง
+            if mute:
+                cmd += ["-an"]  # ตัดเสียงออกทั้งหมด
+            else:
+                cmd += ["-c:a", "aac"]
+
+            # video filters
             vf = []
-            # resolution
             if resolution:
                 try:
-                    # reuse your parser to build WxH string
                     r = VideoProcessor(src)._parse_resolution(resolution)
                     if r:
                         vf.append(f"scale={r}")
                 except Exception:
                     pass
-            # fps
             if fps and fps > 0:
                 vf.append(f"fps={fps}")
-
             if vf:
                 cmd.extend(["-vf", ",".join(vf)])
 
@@ -1820,25 +1842,40 @@ def concat_videos():
             temp_intermediates.append(norm_path)
 
         # -------- Concat normalized clips --------
-        # Use filter_complex concat to merge both audio & video.
-        # Build inputs list
         cmd = ["ffmpeg", "-y"]
         for p in norm_paths:
             cmd.extend(["-i", p])
 
         n = len(norm_paths)
-        filter_inputs = "".join([f"[{i}:v:0][{i}:a:0]" for i in range(n)])
-        filter_graph = f"{filter_inputs}concat=n={n}:v=1:a=1[outv][outa]"
 
-        out_name = f"concat_{uuid.uuid4().hex}.mp4"
-        output_file = os.path.join(TEMP_DIR, out_name)
+        if mute:
+            # วิดีโออย่างเดียว (ไม่มีเสียง)
+            filter_inputs = "".join([f"[{i}:v:0]" for i in range(n)])
+            filter_graph = f"{filter_inputs}concat=n={n}:v=1:a=0[outv]"
 
-        cmd.extend([
-            "-filter_complex", filter_graph,
-            "-map", "[outv]", "-map", "[outa]",
-            "-movflags", "+faststart",
-            output_file
-        ])
+            out_name = f"concat_{uuid.uuid4().hex}.mp4"
+            output_file = os.path.join(TEMP_DIR, out_name)
+
+            cmd.extend([
+                "-filter_complex", filter_graph,
+                "-map", "[outv]",
+                "-movflags", "+faststart",
+                output_file
+            ])
+        else:
+            # วิดีโอ + เสียง
+            filter_inputs = "".join([f"[{i}:v:0][{i}:a:0]" for i in range(n)])
+            filter_graph = f"{filter_inputs}concat=n={n}:v=1:a=1[outv][outa]"
+
+            out_name = f"concat_{uuid.uuid4().hex}.mp4"
+            output_file = os.path.join(TEMP_DIR, out_name)
+
+            cmd.extend([
+                "-filter_complex", filter_graph,
+                "-map", "[outv]", "-map", "[outa]",
+                "-movflags", "+faststart",
+                output_file
+            ])
 
         logger.debug(f"[concat] {' '.join(cmd)}")
         r = subprocess.run(cmd, capture_output=True, text=True)
@@ -1857,11 +1894,12 @@ def concat_videos():
                 "resolution": resolution or "original",
                 "fps": fps,
                 "crf": crf,
-                "preset": preset
+                "preset": preset,
+                "mute": mute
             }
         }
 
-        # remove only original inputs; keep output
+        # ลบอินพุตต้นทาง (เก็บ output ไว้ดาวน์โหลด)
         cleanup_temp_files(*temp_inputs)
 
         elapsed = (time.time() - start_time) * 1000
@@ -1869,10 +1907,12 @@ def concat_videos():
         return create_response(msg="Concat success", data=result)
 
     except Exception as e:
-        # on error: remove everything we created
+        # ถ้า error ให้เก็บกวาดทุกอย่างที่สร้างขึ้น
         cleanup_temp_files(*(temp_inputs + temp_intermediates + ([output_file] if output_file else [])))
         log_error(request_id, e, {"endpoint": "/concat"})
         return create_response(code=500, msg=f"Concat failed: {str(e)}"), 500
+
+
         
 @app.route("/subtitle", methods=["POST"])
 @require_api_key
