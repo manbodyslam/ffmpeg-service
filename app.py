@@ -635,8 +635,13 @@ class VideoProcessor:
             "1440p": "2560:1440",
             "2160p": "3840:2160",  # 4K
             "4k": "3840:2160",
+        "9:16": "1080:1920",
+        "9x16": "1080:1920",
+        "portrait": "1080:1920"
         }
 
+
+        
         resolution_lower = str(resolution).lower()
         if resolution_lower in resolution_presets:
             return resolution_presets[resolution_lower]
