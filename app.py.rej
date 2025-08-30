@@ -1,0 +1,8 @@
+@@ -83,6 +83,7 @@
+ 
+ app = Flask(__name__)
+ 
+ # Configuration from environment variables
+ TEMP_DIR = os.getenv("TEMP_DIR", "/tmp/videos")
+ MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", "524288000"))  # Default: 500MB
++app.config["MAX_CONTENT_LENGTH"] = MAX_FILE_SIZE  # hard cap uploads at WSGI layer
