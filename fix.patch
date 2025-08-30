@@ -1,0 +1,403 @@
+diff --git a/app.py b/app.py
+index 1111111..2222222 100644
+--- a/app.py
++++ b/app.py
+@@ -18,10 +18,10 @@ import threading
+ import logging
+ import logging.handlers
+ from datetime import datetime
+ from urllib.parse import urlparse
+ import requests
+ from flask import Flask, request, jsonify, send_file
+-import magic
++from werkzeug.utils import secure_filename
+ from functools import wraps
+ 
+ # Configure logging
+ def setup_logging():
+@@ -83,6 +83,7 @@ logger = setup_logging()
+ 
+ app = Flask(__name__)
+ 
+ # Configuration from environment variables
+ TEMP_DIR = os.getenv("TEMP_DIR", "/tmp/videos")
+ MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", "524288000"))  # Default: 500MB
++app.config["MAX_CONTENT_LENGTH"] = MAX_FILE_SIZE  # hard cap uploads at WSGI layer
+ FILE_RETENTION_HOURS = int(os.getenv("FILE_RETENTION_HOURS", "2"))
+ CLEANUP_INTERVAL_MINUTES = int(os.getenv("CLEANUP_INTERVAL_MINUTES", "30"))
+ 
+@@ -126,6 +127,14 @@ API_KEYS = (
+ # Base URL configuration for full path URLs
+ BASE_URL = os.getenv("BASE_URL", "").rstrip("/")  # Remove trailing slash
+ 
++# Concurrency & timeout for ffmpeg/ffprobe
++FFMPEG_CONCURRENCY = int(os.getenv("FFMPEG_CONCURRENCY", "2"))
++FFMPEG_TIMEOUT = int(os.getenv("FFMPEG_TIMEOUT", "300"))  # seconds
++_ffmpeg_sem = threading.Semaphore(FFMPEG_CONCURRENCY)
++def run_cmd(cmd, **kwargs):
++    """Wrapper for subprocess.run with semaphore + default timeout"""
++    timeout = kwargs.pop("timeout", FFMPEG_TIMEOUT)
++    with _ffmpeg_sem: return subprocess.run(cmd, timeout=timeout, **kwargs)
+ def log_startup_info():
+     """Log startup information"""
+     logger.info("=" * 60)
+@@ -163,15 +172,34 @@ log_startup_info()
+ 
+ def log_request_info(request_id=None):
+     """Log request information with optional request ID"""
+     if request_id is None:
+         request_id = str(uuid.uuid4())[:8]
+-    
++
++    # redact sensitive headers
++    SENSITIVE_HEADERS = {"authorization", "x-api-key", "cookie", "set-cookie"}
++    def _redact_headers(h):
++        redacted = {}
++        try:
++            items = h.items()
++        except Exception:
++            items = dict(h).items()
++        for k, v in items:
++            if k.lower() in SENSITIVE_HEADERS:
++                redacted[k] = "***REDACTED***"
++            else:
++                redacted[k] = v
++        return redacted
++
+     log_data = {
+         "request_id": request_id,
+         "method": request.method,
+         "path": request.path,
+         "remote_addr": request.remote_addr,
+         "user_agent": request.headers.get("User-Agent", "Unknown"),
+         "content_length": request.content_length,
+         "content_type": request.content_type,
+-        "headers": dict(request.headers),
++        "headers": _redact_headers(request.headers),
+         "args": request.args.to_dict(),
+         "form": request.form.to_dict(),
+         "json": request.get_json(silent=True) if request.is_json else None,
+     }
+@@ -232,6 +260,22 @@ def require_api_key(f):
+ 
+     return decorated_function
+ 
+ 
++def _safe_magic_from_file(path):
++    """best-effort MIME detection without crashing if libmagic is missing"""
++    try:
++        import magic
++        return magic.from_file(path, mime=True)
++    except Exception:
++        return ""
++
++def _safe_magic_from_buffer(buf):
++    try:
++        import magic
++        return magic.from_buffer(buf, mime=True)
++    except Exception:
++        return ""
++
+ class AudioProcessor:
+     """Audio processing utility class"""
+ 
+     def __init__(self, audio_path):
+@@ -252,9 +296,9 @@ class AudioProcessor:
+                 "-show_streams",
+                 self.audio_path,
+             ]
+             
+             logger.debug(f"Running ffprobe command: {' '.join(cmd)}")
+-            result = subprocess.run(
++            result = run_cmd(
+                 cmd, capture_output=True, text=True, check=True
+             )
+             data = json.loads(result.stdout)
+ 
+@@ -353,7 +397,7 @@ class AudioProcessor:
+             # Add output path
+             cmd.extend(["-y", output_path])
+ 
+-            logger.debug(f"Running ffmpeg command: {' '.join(cmd)}")
+-            result = subprocess.run(cmd, capture_output=True, text=True)
++            logger.debug(f"Running ffmpeg command: {' '.join(cmd)}")
++            result = run_cmd(cmd, capture_output=True, text=True)
+             if result.returncode != 0:
+                 logger.error(f"Audio conversion failed: {result.stderr}")
+                 raise Exception(f"Conversion failed: {result.stderr}")
+@@ -395,9 +439,9 @@ class VideoProcessor:
+                 "-show_streams",
+                 self.video_path,
+             ]
+             
+             logger.debug(f"Running ffprobe command: {' '.join(cmd)}")
+-            result = subprocess.run(
++            result = run_cmd(
+                 cmd, capture_output=True, text=True, check=True
+             )
+             data = json.loads(result.stdout)
+ 
+@@ -489,8 +533,8 @@ class VideoProcessor:
+             output_path,
+         ]
+ 
+-        logger.debug(f"Running ffmpeg screenshot command: {' '.join(cmd)}")
+-        result = subprocess.run(cmd, capture_output=True, text=True)
++        logger.debug(f"Running ffmpeg screenshot command: {' '.join(cmd)}")
++        result = run_cmd(cmd, capture_output=True, text=True)
+         if result.returncode != 0:
+             logger.error(f"Screenshot failed at {timestamp}s: {result.stderr}")
+             raise Exception(f"Screenshot failed: {result.stderr}")
+@@ -552,8 +596,8 @@ class VideoProcessor:
+ 
+             cmd.extend(["-y", output_path])
+ 
+-            logger.debug(f"Running ffmpeg conversion command: {' '.join(cmd)}")
+-            result = subprocess.run(cmd, capture_output=True, text=True)
++            logger.debug(f"Running ffmpeg conversion command: {' '.join(cmd)}")
++            result = run_cmd(cmd, capture_output=True, text=True)
+             if result.returncode != 0:
+                 logger.error(f"Video conversion failed: {result.stderr}")
+                 raise Exception(f"Conversion failed: {result.stderr}")
+@@ -654,7 +698,7 @@ def detect_media_type(file_path):
+             return "audio"
+ 
+         # Use magic to detect MIME type
+-        mime_type = magic.from_file(file_path, mime=True)
++        mime_type = _safe_magic_from_file(file_path)
+         if mime_type.startswith("video/"):
+             return "video"
+         elif mime_type.startswith("audio/"):
+             return "audio"
+ 
+@@ -689,7 +733,7 @@ def save_uploaded_file(file):
+             file_content = file.read(1024)
+             file.seek(0)
+-            mime_type = magic.from_buffer(file_content, mime=True)
++            mime_type = _safe_magic_from_buffer(file_content)
+             logger.debug(f"Detected MIME type: {mime_type}")
+             if not (mime_type.startswith("video/") or
+                     mime_type.startswith("audio/")):
+@@ -772,7 +816,7 @@ def _apply_hard_subtitle(video_path, sub_path, fonts_dir=None, crf="23", preset=
+         "-c:a", "copy",
+         out_path
+     ]
+-    r = subprocess.run(cmd, capture_output=True, text=True)
++    r = run_cmd(cmd, capture_output=True, text=True)
+     if r.returncode != 0:
+         raise Exception(f"Hard-sub failed: {r.stderr}")
+     return out_path
+@@ -790,7 +834,7 @@ def _apply_soft_subtitle(video_path, sub_path):
+         "-metadata:s:s:0", "language=th",
+         out_path
+     ]
+-    r = subprocess.run(cmd, capture_output=True, text=True)
++    r = run_cmd(cmd, capture_output=True, text=True)
+     if r.returncode != 0:
+         raise Exception(f"Soft-sub failed: {r.stderr}")
+     return out_path
+@@ -814,7 +858,7 @@ def _mix_bgm(video_path, bgm_path, mode="mix", bgm_gain=0.25):
+         "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+         out_path
+     ]
+-    r = subprocess.run(cmd, capture_output=True, text=True)
++    r = run_cmd(cmd, capture_output=True, text=True)
+     if r.returncode != 0:
+         raise Exception(f"BGM mix failed: {r.stderr}")
+     return out_path
+@@ -839,7 +883,7 @@ def homepage():
+ <head>
+-    <meta charset="UTF-8">
++    <meta charset="UTF-8">
+     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+     <title>FFmpeg Service</title>
+@@ -1043,10 +1087,11 @@ def homepage():
+         <div class="footer" style="text-align:center; margin-top:24px;">
+             <p>
+-                &copy; 2025
+-                <a href="https://github.com/funnyzak/ffmpeg-service"
+-                   target="_blank">FFmpeg Service</a>
+-                &mdash; by <a href="https://github.com/funnyzak"
+-                   target="_blank">@funnyzak</a>
++                &copy; 2025
++                <a href="https://github.com/manbodyslam/ffmpeg-service"
++                   target="_blank">FFmpeg Service</a>
++                &mdash; by <a href="https://github.com/manbodyslam"
++                   target="_blank">@manbodyslam</a>
+                 <span class="separator">|</span>
+                 Built with Flask + FFmpeg
+             </p>
+@@ -1081,7 +1126,7 @@ def process_media():
+         else:
+             data = request.form.to_dict()
+             logger.debug(f"Request {request_id}: Form data received")
+ 
+-        # Get processing options with type conversion for form data
++        # Get processing options with type conversion for form data
+         extract_info = _parse_bool(data.get("extract_info", True))
+         take_screenshots = _parse_bool(data.get("take_screenshots", False))
+-        screenshot_timestamps = _parse_list(data.get("screenshot_timestamps"))
++        screenshot_timestamps = _parse_float_list(data.get("screenshot_timestamps"))
+         screenshot_count = _parse_int(data.get("screenshot_count"))
+         convert_format = data.get("convert_format")
+         convert_quality = data.get("convert_quality", "medium")
+         convert_resolution = data.get("convert_resolution")
+@@ -1178,7 +1223,7 @@ def add_bgm():
+         output_file = _mix_bgm(video_path, bgm_path, mode=mode, bgm_gain=bgm_gain)
+ 
+         result = {
+             "output": {
+                 "filename": os.path.basename(output_file),
+                 "url": create_download_url(os.path.basename(output_file))
+             },
+             "mode": mode,
+             "bgm_gain": bgm_gain
+         }
+@@ -1267,7 +1312,7 @@ def edit_pipeline():
+ 
+                 # normalize
+                 norm_paths = []
+                 for idx, src in enumerate(local_inputs, 1):
+                     norm_name = f"norm_{uuid.uuid4().hex}_{idx}.mp4"
+                     norm_path = os.path.join(TEMP_DIR, norm_name)
+                     cmd = ["ffmpeg", "-y", "-i", src, "-c:v", "libx264", "-c:a", "aac", "-preset", preset, "-crf", crf]
+@@ -1289,7 +1334,7 @@ def edit_pipeline():
+ 
+                     cmd.append(norm_path)
+-                    r = subprocess.run(cmd, capture_output=True, text=True)
++                    r = run_cmd(cmd, capture_output=True, text=True)
+                     if r.returncode != 0:
+                         raise Exception(f"Normalization failed: {r.stderr}")
+                     norm_paths.append(norm_path)
+                     temp_inter.append(norm_path)
+@@ -1306,7 +1351,7 @@ def edit_pipeline():
+                 out_name = f"concat_{uuid.uuid4().hex}.mp4"
+                 current = os.path.join(TEMP_DIR, out_name)
+                 cmd.extend(["-filter_complex", filter_graph, "-map", "[outv]", "-map", "[outa]", "-movflags", "+faststart", current])
+-                r = subprocess.run(cmd, capture_output=True, text=True)
++                r = run_cmd(cmd, capture_output=True, text=True)
+                 if r.returncode != 0:
+                     raise Exception(f"Concat failed: {r.stderr}")
+ 
+@@ -1326,7 +1371,7 @@ def edit_pipeline():
+                 current = _mix_bgm(current, bgm_path, mode=mode, bgm_gain=bgm_gain)
+                 temp_inter.append(current)
+ 
+             elif t == "convert":
+                 if not current:
+                     return create_response(code=400, msg="convert requires a media first"), 400
+@@ -1391,12 +1436,12 @@ def _has_audio_stream(path):
+     try:
+-        r = subprocess.run(
++        r = run_cmd(
+             ["ffprobe", "-v", "error", "-select_streams", "a",
+              "-show_entries", "stream=index", "-of", "csv=p=0", path],
+             capture_output=True, text=True
+         )
+         return r.returncode == 0 and r.stdout.strip() != ""
+     except Exception:
+         return False
+@@ -1471,7 +1516,7 @@ def concat_videos():
+ 
+             logger.debug(f"[concat-normalize] {' '.join(cmd)}")
+-            r = subprocess.run(cmd, capture_output=True, text=True)
++            r = run_cmd(cmd, capture_output=True, text=True)
+             if r.returncode != 0:
+                 raise Exception(f"Normalization failed: {r.stderr}")
+ 
+@@ -1513,7 +1558,7 @@ def concat_videos():
+                 output_file
+             ])
+ 
+-        logger.debug(f"[concat] {' '.join(cmd)}")
+-        r = subprocess.run(cmd, capture_output=True, text=True)
++        logger.debug(f"[concat] {' '.join(cmd)}")
++        r = run_cmd(cmd, capture_output=True, text=True)
+         if r.returncode != 0:
+             raise Exception(f"Concat failed: {r.stderr}")
+ 
+@@ -1629,6 +1674,25 @@ def get_media_info():
+         )
+ 
+ 
+-@app.route("/download/<filename>", methods=["GET"])
++@app.route("/version", methods=["GET"])
++def version():
++    """Return ffmpeg version string (first line)."""
++    try:
++        r = run_cmd(["ffmpeg", "-version"], capture_output=True, text=True, check=False, timeout=10)
++        line0 = (r.stdout or "").splitlines()[0] if r.stdout else ""
++        return create_response(msg="OK", data={"ffmpeg": line0})
++    except Exception as e:
++        log_error(str(uuid.uuid4())[:8], e, {"endpoint": "/version"})
++        return create_response(code=500, msg=f"Version check failed: {str(e)}"), 500
++
++
++@app.route("/download/<path:filename>", methods=["GET", "HEAD"])
+ def download_file(filename):
+     """Download processed files"""
+     start_time = time.time()
+     request_id = log_request_info()
+     
+     try:
+-        logger.info(f"Request {request_id}: Download request for file: {filename}")
+-        
+-        file_path = os.path.join(TEMP_DIR, filename)
++        logger.info(f"Request {request_id}: Download request for file: {filename}")
++        safe_name = secure_filename(filename)
++        file_path = os.path.abspath(os.path.join(TEMP_DIR, safe_name))
++        temp_abs = os.path.abspath(TEMP_DIR)
++        if not file_path.startswith(temp_abs + os.sep):
++            logger.warning(f"Request {request_id}: Invalid filename traversal attempt: {filename}")
++            return create_response(code=400, msg="Invalid filename"), 400
+         if not os.path.exists(file_path):
+             logger.warning(f"Request {request_id}: File not found: {filename}")
+             return create_response(code=404, msg="File not found"), 404
+@@ -1645,9 +1709,11 @@ def download_file(filename):
+         # Get file size for logging
+         file_size = os.path.getsize(file_path)
+         logger.info(f"Request {request_id}: Serving file {filename} ({file_size} bytes)")
+ 
+-        response = send_file(
+-            file_path, as_attachment=True, download_name=filename
+-        )
++        response = send_file(file_path, as_attachment=True, download_name=safe_name)
++        # cache for a day – tweak as needed
++        try:
++            response.headers["Cache-Control"] = "public, max-age=86400"
++        except Exception: pass
+ 
+         if auto_delete:
+             # Schedule file deletion after response is sent
+@@ -1709,6 +1775,26 @@ def internal_error(e):
+     return create_response(code=500, msg="Internal server error"), 500
+ 
+ 
+ # Ensure temp directory exists
+ os.makedirs(TEMP_DIR, exist_ok=True)
+ logger.info(f"Temp directory ensured: {TEMP_DIR}")
+ 
++# ---- helpers: robust parsing ----
++def _parse_float_list(value):
++    """Parse list of floats from JSON string, CSV string, or list."""
++    if value is None:
++        return None
++    if isinstance(value, list):
++        try:
++            return [float(x) for x in value]
++        except Exception:
++            return None
++    if isinstance(value, str):
++        try:
++            arr = json.loads(value)
++            return [float(x) for x in arr]
++        except Exception:
++            try:
++                return [float(x.strip()) for x in value.split(",") if x.strip()]
++            except Exception:
++                return None
++
+ # Start background cleanup thread
+ start_cleanup_thread()
+ 
+ # Initial cleanup on startup
